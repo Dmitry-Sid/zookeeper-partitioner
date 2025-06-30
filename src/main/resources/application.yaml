@@ -1,0 +1,5 @@
+app:
+  workers-count: 4
+  check-status-rate: 5000
+zoo-keeper:
+  host: localhost
