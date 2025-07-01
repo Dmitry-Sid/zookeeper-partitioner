@@ -18,9 +18,10 @@ import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -33,7 +34,8 @@ public class CoordinatorImpl implements Coordinator {
     private final String zooKeeperHost;
     private final int workersCount;
     private final long checkStatusRate;
-    private final AtomicInteger taskCounter = new AtomicInteger();
+    private final BlockingQueue<Integer> partitionsQueue = new LinkedBlockingQueue<>();
+    private final ThreadLocal<Integer> partitionThreadLocal = new ThreadLocal<>();
 
     private volatile ZooKeeper zooKeeper;
     private volatile String currentNode;
@@ -86,6 +88,7 @@ public class CoordinatorImpl implements Coordinator {
         memberInfo = MemberInfo.builder()
                 .rebalancing(true)
                 .workersCount(workersCount)
+                .assignedPartitions(Collections.emptySet())
                 .build();
 
         log.debug("member info has been initialized");
@@ -98,7 +101,7 @@ public class CoordinatorImpl implements Coordinator {
         checkNodeExist();
         checkNewMembers();
 
-        if (memberInfo.isRebalancing() && taskCounter.get() == 0) {
+        if (memberInfo.isRebalancing() && getActiveTasks() == 0) {
             if (memberInfo.isLeader()) {
                 if (!memberInfo.isAcceptedNewPartitions()) {
                     distributePartitionsAsLeader();
@@ -117,6 +120,11 @@ public class CoordinatorImpl implements Coordinator {
                 }
             }
         }
+    }
+
+    @Override
+    public int getActiveTasks() {
+        return getAssignedPartitions().size() - partitionsQueue.size();
     }
 
     private void checkNodeExist() throws InterruptedException, KeeperException, JsonProcessingException {
@@ -180,6 +188,8 @@ public class CoordinatorImpl implements Coordinator {
             zooKeeper.setData(memberMetaData.node, objectMapper.writeValueAsBytes(memberMetaData.memberInfo), memberMetaData.version);
         }
 
+        fillPartitionsQueue();
+
         log.debug("distribution of the partitions successfully finished");
     }
 
@@ -215,6 +225,7 @@ public class CoordinatorImpl implements Coordinator {
         memberInfo.setAcceptedNewPartitions(true);
         zooKeeper.setData(currentNode, objectMapper.writeValueAsBytes(memberInfo), currentNodeVersion);
         this.memberInfo = memberInfo;
+        fillPartitionsQueue();
 
         if (log.isDebugEnabled()) {
             log.debug("the node {} is assigned partitions: {}", currentNode, Arrays.toString(memberInfo.getAssignedPartitions().toArray()));
@@ -251,19 +262,27 @@ public class CoordinatorImpl implements Coordinator {
         log.debug("leader successfully rebalanced");
     }
 
-    @Override
-    public void startTask() {
-        if (memberInfo.isRebalancing()) {
-            throw new IllegalStateException("cannot start new task in rebalancing state");
-        }
-        taskCounter.incrementAndGet();
+    private synchronized void fillPartitionsQueue() {
+        partitionsQueue.clear();
+        partitionsQueue.addAll(memberInfo.getAssignedPartitions());
     }
 
     @Override
-    public void endTask() {
-        if (taskCounter.decrementAndGet() < 0) {
-            taskCounter.set(0);
-            throw new IllegalStateException("no task is running right now");
+    public int startTask() throws InterruptedException {
+        while (isRebalancing()) {
+            Thread.sleep(100);
+        }
+        final Integer partition = partitionsQueue.take();
+        partitionThreadLocal.set(partition);
+        return partition;
+    }
+
+    @Override
+    public void finishTask() {
+        final Integer partition = partitionThreadLocal.get();
+        if (partition != null) {
+            partitionsQueue.add(partition);
+            partitionThreadLocal.set(null);
         }
     }
 

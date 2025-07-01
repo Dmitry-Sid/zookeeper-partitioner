@@ -1,0 +1,10 @@
+app:
+  workers-count: 6
+  check-status-rate: 5000
+zoo-keeper:
+  host: localhost
+server:
+  port: 8082
+logging:
+  level:
+    ru.dsid: TRACE

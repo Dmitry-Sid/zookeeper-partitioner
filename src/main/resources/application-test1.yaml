@@ -3,6 +3,8 @@ app:
   check-status-rate: 5000
 zoo-keeper:
   host: localhost
+server:
+  port: 8080
 logging:
   level:
     ru.dsid: TRACE
