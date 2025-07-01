@@ -3,3 +3,6 @@ app:
   check-status-rate: 5000
 zoo-keeper:
   host: localhost
+logging:
+  level:
+    ru.dsid: TRACE

@@ -2,8 +2,7 @@ package ru.dsid.zookeeperpartitioner.service.impl;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.AllArgsConstructor;
-import lombok.SneakyThrows;
+import lombok.*;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
@@ -11,34 +10,34 @@ import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooKeeper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
-import ru.dsid.zookeeperpartitioner.data.MemberInfo;
+import org.springframework.util.CollectionUtils;
 import ru.dsid.zookeeperpartitioner.service.Coordinator;
 import ru.dsid.zookeeperpartitioner.service.ZooKeeperConnector;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
 import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 @Slf4j
 @Service
 public class CoordinatorImpl implements Coordinator {
+    private static final String ROOT = "/partitioner";
     private final ObjectMapper objectMapper;
     private final ZooKeeperConnector zooKeeperConnector;
     private final String zooKeeperHost;
     private final int workersCount;
     private final long checkStatusRate;
+    private final AtomicInteger taskCounter = new AtomicInteger();
 
     private volatile ZooKeeper zooKeeper;
     private volatile String currentNode;
-    private volatile List<String> members;
+    private volatile List<String> members = Collections.emptyList();
     private volatile MemberInfo memberInfo;
 
     public CoordinatorImpl(ObjectMapper objectMapper,
@@ -72,10 +71,15 @@ public class CoordinatorImpl implements Coordinator {
         log.debug("connecting to group...");
 
         initMemberInfo();
-        currentNode = zooKeeper.create("/partitioner/node", objectMapper.writeValueAsBytes(memberInfo),
+        try {
+            zooKeeper.create(ROOT, new byte[0], ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.PERSISTENT);
+        } catch (KeeperException.NodeExistsException e) {
+            // ignore
+        }
+        currentNode = zooKeeper.create(ROOT + "/node", objectMapper.writeValueAsBytes(memberInfo),
                 ZooDefs.Ids.OPEN_ACL_UNSAFE, CreateMode.EPHEMERAL_SEQUENTIAL);
 
-        log.debug("connected to group successfully");
+        log.debug("connected to group successfully with nodePath {}", currentNode);
     }
 
     private void initMemberInfo() {
@@ -94,15 +98,23 @@ public class CoordinatorImpl implements Coordinator {
         checkNodeExist();
         checkNewMembers();
 
-        if (!memberInfo.isLeader() && checkLeaderRebalancing()) {
-            receiveAssignedPartitionsAsFollower();
-        }
+        if (memberInfo.isRebalancing() && taskCounter.get() == 0) {
+            if (memberInfo.isLeader()) {
+                if (!memberInfo.isAcceptedNewPartitions()) {
+                    distributePartitionsAsLeader();
+                }
 
-        if (memberInfo.isRebalancing()) {
-            if (!memberInfo.isLeader()) {
-                memberInfo.setRebalancing(!checkLeaderRebalancing());
-            } else if (checkAllMembersAcceptedNewPartitions()) {
-                stopLeaderRebalancing();
+                if (memberInfo.isRebalancing() && checkAllFollowersAcceptedNewPartitions()) {
+                    stopLeaderRebalancing();
+                }
+            } else {
+                if (!memberInfo.isAcceptedNewPartitions()) {
+                    receiveAssignedPartitionsAsFollower();
+                }
+                if (memberInfo.isAcceptedNewPartitions() && !checkLeaderRebalancing()) {
+                    memberInfo.setRebalancing(false);
+                    log.debug("follower successfully rebalanced");
+                }
             }
         }
     }
@@ -115,35 +127,35 @@ public class CoordinatorImpl implements Coordinator {
     }
 
     private void checkNewMembers() throws InterruptedException, KeeperException, IOException {
-        final List<String> nodes = zooKeeper.getChildren("/partitioner/nodes", false);
-        Collections.sort(nodes);
+        final List<String> members = zooKeeper.getChildren(ROOT, false).stream().sorted().map(n -> ROOT + "/" + n)
+                .collect(Collectors.toList());
 
-        if (!nodes.equals(members)) {
-            log.debug("nodes doesn't equal members");
-            if (nodes.get(0).equals(currentNode)) {
-                distributePartitionsAsLeader();
-            } else {
-                receiveAssignedPartitionsAsFollower();
+        if (!members.equals(this.members)) {
+            log.debug("members list changed");
+            memberInfo.setRebalancing(true);
+            memberInfo.setLeader(members.get(0).equals(currentNode));
+            memberInfo.setAcceptedNewPartitions(false);
+
+            if (memberInfo.isLeader()) {
+                log.debug("current node is a leader");
             }
-            members = nodes;
+            this.members = members;
         }
     }
 
     private void distributePartitionsAsLeader() throws InterruptedException, KeeperException, IOException {
-        log.debug("current node is a leader");
-        log.debug("distribution of the partitions started...");
+        checkNodeIsLeader();
 
-        memberInfo.setLeader(true);
-        memberInfo.setRebalancing(true);
+        log.debug("distribution of the partitions started...");
         final boolean rebalancing = members.size() > 1;
 
         int totalWorkers = 0;
         final List<MemberMetaData> memberMetaDataList = new ArrayList<>();
-        for (String node : members) {
+        for (int i = 0; i < members.size(); i++) {
+            final String node = members.get(i);
             final MemberInfo memberInfo;
-            if (currentNode.equals(node)) {
+            if (i == 0) {
                 memberInfo = this.memberInfo;
-                memberInfo.setLeader(true);
                 memberInfo.setAcceptedNewPartitions(true);
             } else {
                 memberInfo = objectMapper.readValue(zooKeeper.getData(node, null, null), MemberInfo.class);
@@ -151,66 +163,138 @@ public class CoordinatorImpl implements Coordinator {
                 memberInfo.setAcceptedNewPartitions(false);
             }
             memberInfo.setRebalancing(rebalancing);
-            final int version = zooKeeper.exists(node, null).getVersion();
 
             memberInfo.setAssignedPartitions(IntStream.range(totalWorkers, totalWorkers + memberInfo.getWorkersCount())
                     .boxed().collect(Collectors.toSet()));
 
-            memberMetaDataList.add(new MemberMetaData(node, version, memberInfo));
+            memberMetaDataList.add(new MemberMetaData(node, -1, memberInfo));
             totalWorkers += memberInfo.getWorkersCount();
+
+            if (log.isDebugEnabled()) {
+                log.debug("the node {} is assigned partitions: {}", node, Arrays.toString(memberInfo.getAssignedPartitions().toArray()));
+            }
         }
 
-        for (MemberMetaData memberMetaData : memberMetaDataList) {
+        for (final MemberMetaData memberMetaData : memberMetaDataList) {
             memberMetaData.memberInfo.setTotalWorkers(totalWorkers);
-            zooKeeper.setData(memberMetaData.node, objectMapper.writeValueAsBytes(memberInfo), memberMetaData.version);
+            zooKeeper.setData(memberMetaData.node, objectMapper.writeValueAsBytes(memberMetaData.memberInfo), memberMetaData.version);
         }
 
         log.debug("distribution of the partitions successfully finished");
     }
 
+    private void checkNodeIsLeader() {
+        if (!memberInfo.isLeader()) {
+            throw new IllegalStateException("node must be a leader!");
+        }
+    }
+
+    private void checkNodeIsFollower() {
+        if (memberInfo.isLeader()) {
+            throw new IllegalStateException("node must be a follower!");
+        }
+    }
+
     private void receiveAssignedPartitionsAsFollower() throws InterruptedException, KeeperException, IOException {
+        checkNodeIsFollower();
+
+        if (memberInfo.isAcceptedNewPartitions()) {
+            throw new IllegalStateException("node has already received assigned partitions");
+        }
+
         log.debug("receiving assigned partitions as follower...");
 
-        final int version = zooKeeper.exists(currentNode, null).getVersion();
-        memberInfo = objectMapper.readValue(zooKeeper.getData(currentNode, null, null), MemberInfo.class);
+        final int currentNodeVersion = zooKeeper.exists(currentNode, null).getVersion();
+        final MemberInfo memberInfo = objectMapper.readValue(zooKeeper.getData(currentNode, null, null), MemberInfo.class);
+
+        if (memberInfo.isAcceptedNewPartitions() || CollectionUtils.isEmpty(memberInfo.getAssignedPartitions())) {
+            log.debug("there is no assigned partitions yet");
+            return;
+        }
+
         memberInfo.setAcceptedNewPartitions(true);
-        zooKeeper.setData(currentNode, objectMapper.writeValueAsBytes(memberInfo), version);
+        zooKeeper.setData(currentNode, objectMapper.writeValueAsBytes(memberInfo), currentNodeVersion);
+        this.memberInfo = memberInfo;
+
+        if (log.isDebugEnabled()) {
+            log.debug("the node {} is assigned partitions: {}", currentNode, Arrays.toString(memberInfo.getAssignedPartitions().toArray()));
+        }
 
         log.debug("successfully received assigned partitions as follower");
     }
 
-    private boolean checkAllMembersAcceptedNewPartitions() {
-        return members.stream().filter(n -> !n.equals(currentNode)).allMatch(m -> {
-            try {
-                return objectMapper.readValue(zooKeeper.getData(m, null, null), MemberInfo.class).isAcceptedNewPartitions();
-            } catch (IOException | KeeperException | InterruptedException e) {
-                throw new RuntimeException(e);
+    private boolean checkAllFollowersAcceptedNewPartitions() throws InterruptedException, KeeperException, IOException {
+        for (int i = 1; i < members.size(); i++) {
+            if (!objectMapper.readValue(zooKeeper.getData(members.get(i), null, null), MemberInfo.class).isAcceptedNewPartitions()) {
+                return false;
             }
-        });
-    }
-
-    private void stopLeaderRebalancing() throws InterruptedException, KeeperException, IOException {
-        log.debug("stopping leader rebalancing...");
-        zooKeeper.setData(currentNode, objectMapper.writeValueAsBytes(memberInfo), zooKeeper.exists(currentNode, null).getVersion());
-        memberInfo.setRebalancing(false);
-        log.debug("leader successfully rebalanced");
+        }
+        return true;
     }
 
     private boolean checkLeaderRebalancing() throws InterruptedException, KeeperException, IOException {
         return objectMapper.readValue(zooKeeper.getData(members.get(0), null, null), MemberInfo.class).isRebalancing();
     }
 
-    @Override
-    public Set<Integer> getAssignedPartitions() {
-        if (memberInfo.isRebalancing()) {
-            return Collections.emptySet();
+
+    private void stopLeaderRebalancing() throws InterruptedException, KeeperException, IOException {
+        checkNodeIsLeader();
+
+        log.debug("stopping leader rebalancing...");
+        memberInfo.setRebalancing(false);
+        for (final String node : members) {
+            final MemberInfo memberInfo = objectMapper.readValue(zooKeeper.getData(node, null, null), MemberInfo.class);
+            memberInfo.setRebalancing(false);
+            zooKeeper.setData(node, objectMapper.writeValueAsBytes(memberInfo), -1);
         }
-        return memberInfo.getAssignedPartitions();
+
+        log.debug("leader successfully rebalanced");
+    }
+
+    @Override
+    public void startTask() {
+        if (memberInfo.isRebalancing()) {
+            throw new IllegalStateException("cannot start new task in rebalancing state");
+        }
+        taskCounter.incrementAndGet();
+    }
+
+    @Override
+    public void endTask() {
+        if (taskCounter.decrementAndGet() < 0) {
+            taskCounter.set(0);
+            throw new IllegalStateException("no task is running right now");
+        }
+    }
+
+    @Override
+    public int getWorkersCount() {
+        return memberInfo.getWorkersCount();
+    }
+
+    @Override
+    public boolean isLeader() {
+        return memberInfo.isLeader();
     }
 
     @Override
     public boolean isRebalancing() {
         return memberInfo.isRebalancing();
+    }
+
+    @Override
+    public boolean isAcceptedNewPartitions() {
+        return memberInfo.isAcceptedNewPartitions();
+    }
+
+    @Override
+    public int getTotalWorkers() {
+        return memberInfo.getTotalWorkers();
+    }
+
+    @Override
+    public Set<Integer> getAssignedPartitions() {
+        return memberInfo.getAssignedPartitions();
     }
 
     @PreDestroy
@@ -223,5 +307,19 @@ public class CoordinatorImpl implements Coordinator {
         private final String node;
         private final int version;
         private final MemberInfo memberInfo;
+    }
+
+    @Setter
+    @Getter
+    @NoArgsConstructor
+    @AllArgsConstructor
+    @Builder
+    private static class MemberInfo {
+        private volatile int workersCount;
+        private volatile boolean leader;
+        private volatile boolean rebalancing;
+        private volatile boolean acceptedNewPartitions;
+        private volatile int totalWorkers;
+        private volatile Set<Integer> assignedPartitions;
     }
 }
