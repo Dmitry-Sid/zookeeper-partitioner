@@ -8,6 +8,7 @@ import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooKeeper;
+import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
@@ -22,6 +23,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -34,6 +36,7 @@ public class CoordinatorImpl implements Coordinator {
     private final String zooKeeperHost;
     private final int workersCount;
     private final long checkStatusRate;
+    private final AtomicInteger activeTasks = new AtomicInteger();
     private final BlockingQueue<Integer> partitionsQueue = new LinkedBlockingQueue<>();
     private final ThreadLocal<Integer> partitionThreadLocal = new ThreadLocal<>();
 
@@ -56,7 +59,7 @@ public class CoordinatorImpl implements Coordinator {
 
     @PostConstruct
     private void init() throws Exception {
-        zooKeeper = zooKeeperConnector.connect(zooKeeperHost);
+        connectToZookeeper();
         connectToGroup();
         checkStatus();
         Executors.newScheduledThreadPool(1).scheduleAtFixedRate(() -> {
@@ -65,8 +68,20 @@ public class CoordinatorImpl implements Coordinator {
             } catch (Throwable e) {
                 log.error("error while checking status", e);
                 initMemberInfo();
+                if (e instanceof KeeperException.ConnectionLossException) {
+                    try {
+                        connectToZookeeper();
+                    } catch (IOException | InterruptedException ex) {
+                        log.error("error while connection to zookeeper", e);
+                    }
+                }
             }
         }, checkStatusRate, checkStatusRate, TimeUnit.MILLISECONDS);
+    }
+
+    private void connectToZookeeper() throws IOException, InterruptedException {
+        zooKeeper = zooKeeperConnector.connect(zooKeeperHost);
+        log.info("successfully connected to zookeeper");
     }
 
     private void connectToGroup() throws InterruptedException, KeeperException, JsonProcessingException {
@@ -124,7 +139,7 @@ public class CoordinatorImpl implements Coordinator {
 
     @Override
     public int getActiveTasks() {
-        return getAssignedPartitions().size() - partitionsQueue.size();
+        return activeTasks.get();
     }
 
     private void checkNodeExist() throws InterruptedException, KeeperException, JsonProcessingException {
@@ -247,7 +262,6 @@ public class CoordinatorImpl implements Coordinator {
         return objectMapper.readValue(zooKeeper.getData(members.get(0), null, null), MemberInfo.class).isRebalancing();
     }
 
-
     private void stopLeaderRebalancing() throws InterruptedException, KeeperException, IOException {
         checkNodeIsLeader();
 
@@ -274,6 +288,7 @@ public class CoordinatorImpl implements Coordinator {
         }
         final Integer partition = partitionsQueue.take();
         partitionThreadLocal.set(partition);
+        activeTasks.incrementAndGet();
         return partition;
     }
 
@@ -283,6 +298,7 @@ public class CoordinatorImpl implements Coordinator {
         if (partition != null) {
             partitionsQueue.add(partition);
             partitionThreadLocal.set(null);
+            activeTasks.decrementAndGet();
         }
     }
 
