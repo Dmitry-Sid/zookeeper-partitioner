@@ -43,7 +43,7 @@ public class TestWorker implements Worker {
                         try {
                             final int partition = coordinator.startTask();
                             log.info("making some stub work for partition: {}, totalWorkers: {}", partition, coordinator.getTotalWorkers());
-                            Thread.sleep(300 + random.nextLong(5000));
+                            Thread.sleep(1000 + random.nextLong(10_000));
                         } finally {
                             coordinator.finishTask();
                         }

@@ -17,7 +17,7 @@ public interface Coordinator {
 
     boolean isLeader();
 
-    boolean isRebalancing();
+    boolean isBalancing();
 
     boolean isAcceptedNewPartitions();
 

@@ -8,7 +8,6 @@ import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.ZooDefs;
 import org.apache.zookeeper.ZooKeeper;
-import org.slf4j.MDC;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.util.CollectionUtils;
@@ -101,7 +100,7 @@ public class CoordinatorImpl implements Coordinator {
 
     private void initMemberInfo() {
         memberInfo = MemberInfo.builder()
-                .rebalancing(true)
+                .balancing(true)
                 .workersCount(workersCount)
                 .assignedPartitions(Collections.emptySet())
                 .build();
@@ -116,21 +115,21 @@ public class CoordinatorImpl implements Coordinator {
         checkNodeExist();
         checkNewMembers();
 
-        if (memberInfo.isRebalancing() && getActiveTasks() == 0) {
+        if (memberInfo.isBalancing() && getActiveTasks() == 0) {
             if (memberInfo.isLeader()) {
                 if (!memberInfo.isAcceptedNewPartitions()) {
                     distributePartitionsAsLeader();
                 }
 
-                if (memberInfo.isRebalancing() && checkAllFollowersAcceptedNewPartitions()) {
-                    stopLeaderRebalancing();
+                if (memberInfo.isBalancing() && checkAllFollowersAcceptedNewPartitions()) {
+                    stopLeaderBalancing();
                 }
             } else {
                 if (!memberInfo.isAcceptedNewPartitions()) {
                     receiveAssignedPartitionsAsFollower();
                 }
-                if (memberInfo.isAcceptedNewPartitions() && !checkLeaderRebalancing()) {
-                    memberInfo.setRebalancing(false);
+                if (memberInfo.isAcceptedNewPartitions() && !checkLeaderBalancing()) {
+                    memberInfo.setBalancing(false);
                     log.debug("follower successfully rebalanced");
                 }
             }
@@ -155,7 +154,7 @@ public class CoordinatorImpl implements Coordinator {
 
         if (!members.equals(this.members)) {
             log.debug("members list changed");
-            memberInfo.setRebalancing(true);
+            memberInfo.setBalancing(true);
             memberInfo.setLeader(members.get(0).equals(currentNode));
             memberInfo.setAcceptedNewPartitions(false);
 
@@ -170,7 +169,7 @@ public class CoordinatorImpl implements Coordinator {
         checkNodeIsLeader();
 
         log.debug("distribution of the partitions started...");
-        final boolean rebalancing = members.size() > 1;
+        final boolean balancing = members.size() > 1;
 
         int totalWorkers = 0;
         final List<MemberMetaData> memberMetaDataList = new ArrayList<>();
@@ -185,7 +184,7 @@ public class CoordinatorImpl implements Coordinator {
                 memberInfo.setLeader(false);
                 memberInfo.setAcceptedNewPartitions(false);
             }
-            memberInfo.setRebalancing(rebalancing);
+            memberInfo.setBalancing(balancing);
 
             memberInfo.setAssignedPartitions(IntStream.range(totalWorkers, totalWorkers + memberInfo.getWorkersCount())
                     .boxed().collect(Collectors.toSet()));
@@ -258,18 +257,18 @@ public class CoordinatorImpl implements Coordinator {
         return true;
     }
 
-    private boolean checkLeaderRebalancing() throws InterruptedException, KeeperException, IOException {
-        return objectMapper.readValue(zooKeeper.getData(members.get(0), null, null), MemberInfo.class).isRebalancing();
+    private boolean checkLeaderBalancing() throws InterruptedException, KeeperException, IOException {
+        return objectMapper.readValue(zooKeeper.getData(members.get(0), null, null), MemberInfo.class).isBalancing();
     }
 
-    private void stopLeaderRebalancing() throws InterruptedException, KeeperException, IOException {
+    private void stopLeaderBalancing() throws InterruptedException, KeeperException, IOException {
         checkNodeIsLeader();
 
-        log.debug("stopping leader rebalancing...");
-        memberInfo.setRebalancing(false);
+        log.debug("stopping leader balancing...");
+        memberInfo.setBalancing(false);
         for (final String node : members) {
             final MemberInfo memberInfo = objectMapper.readValue(zooKeeper.getData(node, null, null), MemberInfo.class);
-            memberInfo.setRebalancing(false);
+            memberInfo.setBalancing(false);
             zooKeeper.setData(node, objectMapper.writeValueAsBytes(memberInfo), -1);
         }
 
@@ -283,7 +282,7 @@ public class CoordinatorImpl implements Coordinator {
 
     @Override
     public int startTask() throws InterruptedException {
-        while (isRebalancing()) {
+        while (isBalancing()) {
             Thread.sleep(100);
         }
         final Integer partition = partitionsQueue.take();
@@ -295,11 +294,12 @@ public class CoordinatorImpl implements Coordinator {
     @Override
     public void finishTask() {
         final Integer partition = partitionThreadLocal.get();
-        if (partition != null) {
-            partitionsQueue.add(partition);
-            partitionThreadLocal.set(null);
-            activeTasks.decrementAndGet();
+        if (partition == null) {
+            throw new IllegalStateException("the thread doesn't have assigned partition");
         }
+        partitionsQueue.add(partition);
+        partitionThreadLocal.set(null);
+        activeTasks.decrementAndGet();
     }
 
     @Override
@@ -313,8 +313,8 @@ public class CoordinatorImpl implements Coordinator {
     }
 
     @Override
-    public boolean isRebalancing() {
-        return memberInfo.isRebalancing();
+    public boolean isBalancing() {
+        return memberInfo.isBalancing();
     }
 
     @Override
@@ -352,7 +352,7 @@ public class CoordinatorImpl implements Coordinator {
     private static class MemberInfo {
         private volatile int workersCount;
         private volatile boolean leader;
-        private volatile boolean rebalancing;
+        private volatile boolean balancing;
         private volatile boolean acceptedNewPartitions;
         private volatile int totalWorkers;
         private volatile Set<Integer> assignedPartitions;
